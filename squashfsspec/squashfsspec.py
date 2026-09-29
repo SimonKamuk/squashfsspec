@@ -1,5 +1,6 @@
 # Standard library
 import io
+import os
 
 # Third-party
 import fsspec
@@ -11,7 +12,9 @@ class SquashFSFileSystem(AbstractFileSystem):
     """Read-only fsspec filesystem for browsing SquashFS archives.
 
     Inputs:
-    - fo: path or file-like object pointing to a SquashFS image.
+    - fo: path (``str`` or ``os.PathLike``) or binary file-like object
+      pointing to a SquashFS image. A path is opened with ``fsspec.open``
+      and closed again by :meth:`close`; a file-like object is left open.
     - offset: byte offset into ``fo`` where the SquashFS image starts.
 
     Outputs:
@@ -33,6 +36,8 @@ class SquashFSFileSystem(AbstractFileSystem):
                 "SquashFSFileSystem requires 'fo' (file-like object or path)"
             )
 
+        if isinstance(fo, os.PathLike):
+            fo = os.fspath(fo)
         self._close_fo = isinstance(fo, str)
         if isinstance(fo, str):
             self._fo_ref = fsspec.open(fo, "rb")
@@ -60,15 +65,67 @@ class SquashFSFileSystem(AbstractFileSystem):
         if self.closed:
             raise ValueError("I/O operation on closed filesystem.")
 
+    _MAX_SYMLINK_DEPTH = 40
+
+    def _resolve(self, entry, path):
+        """Follow symlinks until a non-link inode is reached.
+
+        Input:
+        - entry: dissect inode, possibly a symlink.
+        - path: archive path used for error messages.
+
+        Output:
+        - The inode the link chain ends at.
+
+        Raises ``FileNotFoundError`` for dangling links and for chains longer
+        than ``_MAX_SYMLINK_DEPTH`` (the same limit as the Linux kernel).
+        """
+        depth = 0
+        while entry.is_symlink():
+            depth += 1
+            if depth > self._MAX_SYMLINK_DEPTH:
+                raise FileNotFoundError(
+                    f"{path}: too many levels of symbolic links"
+                )
+            try:
+                entry = entry.link_inode
+            except Exception as exc:
+                raise FileNotFoundError(
+                    f"{path}: dangling symlink to {entry.link!r}"
+                ) from exc
+        return entry
+
+    def _get(self, path):
+        """Return the inode at ``path`` with a trailing symlink resolved.
+
+        Raises ``FileNotFoundError`` when the path or the link target does
+        not exist.
+        """
+        try:
+            entry = self.sfs.get(path)
+        except Exception as exc:
+            raise FileNotFoundError(path) from exc
+        return self._resolve(entry, path)
+
+    @staticmethod
+    def _info_fields(entry):
+        """Return the ``size`` and ``type`` fields for a resolved inode."""
+        if entry.is_dir():
+            return {"size": 0, "type": "directory"}
+        return {"size": entry.size, "type": "file"}
+
     @classmethod
     def _strip_protocol(cls, path):
-        """Normalize paths to absolute archive-internal paths.
+        """Normalize paths to archive-relative paths.
 
         Input:
         - path: string path that may include protocol prefixes.
 
         Output:
-        - Path string rooted at ``/`` within the SquashFS image.
+        - Path string relative to the image root, without leading or
+          trailing slashes. The root itself is the empty string. This is
+          the same convention fsspec's archive filesystems use, and it
+          matches the names returned by ``ls``, ``info`` and ``find``.
         """
         path = super()._strip_protocol(path)
 
@@ -83,9 +140,7 @@ class SquashFSFileSystem(AbstractFileSystem):
             # Handle cases like some_path://inner_path
             path = path.split("://", 1)[1]
 
-        if not path.startswith("/"):
-            path = "/" + path
-        return path
+        return path.strip("/")
 
     def ls(self, path, detail=True, **kwargs):
         """List members at ``path``.
@@ -99,37 +154,29 @@ class SquashFSFileSystem(AbstractFileSystem):
         """
         self._check_closed()
         path = self._strip_protocol(path)
-
-        try:
-            entry = self.sfs.get(path)
-        except Exception:
-            raise FileNotFoundError(path)
+        entry = self._get(path)
 
         if entry.is_dir():
             out = []
             for name, child in entry.listdir().items():
-                child_path = (path.rstrip("/") + "/" + name).lstrip("/")
+                child_path = f"{path}/{name}" if path else name
                 if detail:
-                    out.append(
-                        {
-                            "name": child_path,
-                            "size": child.size if not child.is_dir() else 0,
-                            "type": "directory" if child.is_dir() else "file",
-                        }
-                    )
+                    try:
+                        target = self._resolve(child, child_path)
+                    except FileNotFoundError:
+                        # Dangling symlink: list it, but as neither file
+                        # nor directory, like fsspec's local filesystem.
+                        fields = {"size": 0, "type": "other"}
+                    else:
+                        fields = self._info_fields(target)
+                    out.append({"name": child_path, **fields})
                 else:
                     out.append(child_path)
             return out
         else:
             if detail:
-                return [
-                    {
-                        "name": path.lstrip("/"),
-                        "size": entry.size,
-                        "type": "file",
-                    }
-                ]
-            return [path.lstrip("/")]
+                return [{"name": path, **self._info_fields(entry)}]
+            return [path]
 
     def info(self, path, **kwargs):
         """Return metadata for one archive member.
@@ -142,40 +189,32 @@ class SquashFSFileSystem(AbstractFileSystem):
         """
         self._check_closed()
         path = self._strip_protocol(path)
-        try:
-            entry = self.sfs.get(path)
-        except Exception:
-            raise FileNotFoundError(path)
-
-        return {
-            "name": path.lstrip("/"),
-            "size": entry.size if not entry.is_dir() else 0,
-            "type": "directory" if entry.is_dir() else "file",
-        }
+        entry = self._get(path)
+        return {"name": path, **self._info_fields(entry)}
 
     def exists(self, path, **kwargs):
         self._check_closed()
         path = self._strip_protocol(path)
         try:
-            self.sfs.get(path)
+            self._get(path)
             return True
-        except Exception:
+        except FileNotFoundError:
             return False
 
     def isdir(self, path):
         self._check_closed()
         path = self._strip_protocol(path)
         try:
-            return self.sfs.get(path).is_dir()
-        except Exception:
+            return self._get(path).is_dir()
+        except FileNotFoundError:
             return False
 
     def isfile(self, path):
         self._check_closed()
         path = self._strip_protocol(path)
         try:
-            return not self.sfs.get(path).is_dir()
-        except Exception:
+            return not self._get(path).is_dir()
+        except FileNotFoundError:
             return False
 
     def _open(self, path, mode="rb", **kwargs):
@@ -187,13 +226,18 @@ class SquashFSFileSystem(AbstractFileSystem):
 
         Output:
         - File-like object for reading bytes.
+
+        Raises ``FileNotFoundError`` if ``path`` does not exist and
+        ``IsADirectoryError`` if it names a directory.
         """
         self._check_closed()
         if mode != "rb":
             raise ValueError("ReadOnly filesystem")
         path = self._strip_protocol(path)
-        entry = self.sfs.get(path)
-        return _MemberFileProxy(entry.open())
+        entry = self._get(path)
+        if entry.is_dir():
+            raise IsADirectoryError(path)
+        return _MemberFileProxy(entry.open(), owner=self)
 
     def close(self):
         """Close filesystem resources and owned archive handle."""
@@ -226,10 +270,16 @@ class _MemberFileProxy(io.IOBase):
     """Minimal logical stream wrapper with real close semantics.
     Needed to enable closing a subfile stream without closing the entire
     SquashFS file-like object.
+
+    The proxy holds a reference to the filesystem it came from. The
+    filesystem's ``__del__`` closes the archive handle, so without this
+    reference a member could stop working as soon as the caller dropped
+    the filesystem, e.g. ``fsspec.open(url).open().read()``.
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw, owner=None):
         self._raw = raw
+        self._owner = owner
 
     def readable(self):
         return not self.closed
@@ -263,6 +313,7 @@ class _MemberFileProxy(io.IOBase):
         try:
             self._raw.close()
         finally:
+            self._owner = None
             super().close()
 
     def __getattr__(self, name):
@@ -282,19 +333,41 @@ class OffsetWrapper:
     """
 
     def __init__(self, fo, offset):
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
         self.fo = fo
         self.offset = offset
+        self.fo.seek(self.offset)
 
-    def seek(self, offset, whence=0):
-        if whence == 0:
-            return self.fo.seek(self.offset + offset)
-        return self.fo.seek(offset, whence)
+    def seek(self, offset, whence=io.SEEK_SET):
+        """Seek relative to the embedded image; returns the new position."""
+        if whence == io.SEEK_SET:
+            if offset < 0:
+                raise ValueError(f"negative seek position {offset}")
+            pos = self.fo.seek(self.offset + offset)
+        else:
+            pos = self.fo.seek(offset, whence)
+            if pos < self.offset:
+                pos = self.fo.seek(self.offset)
+        return pos - self.offset
 
     def read(self, size=-1):
         return self.fo.read(size)
 
+    def readinto(self, buffer):
+        return self.fo.readinto(buffer)
+
     def tell(self):
         return self.fo.tell() - self.offset
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def writable(self):
+        return False
 
     def __enter__(self):
         return self
