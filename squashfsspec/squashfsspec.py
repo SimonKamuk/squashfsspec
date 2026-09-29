@@ -26,6 +26,12 @@ class SquashFSFileSystem(AbstractFileSystem):
     cachable = False  # codespell:ignore cachable
 
     def __init__(self, fo=None, offset=0, **kwargs):
+        # State that close() relies on, set before anything can fail.
+        self._closed = False
+        self._close_fo = False
+        self.fo = None
+        self._fo_ref = None
+        self.sfs = None
         super().__init__(**kwargs)
         if fo is None:
             # Try to get fo from kwargs if passed there
@@ -44,16 +50,18 @@ class SquashFSFileSystem(AbstractFileSystem):
             self.fo = self._fo_ref.open()
         else:
             self.fo = fo
-            self._fo_ref = None
         self.offset = offset
-        # SquashFS in dissect can take a file-like object
-        # We might need to wrap it if it has an offset
-        if self.offset != 0:
-            # Simple wrapper to handle offset if dissect doesn't
-            self.sfs = SquashFS(OffsetWrapper(self.fo, self.offset))
-        else:
-            self.sfs = SquashFS(self.fo)
-        self._closed = False
+        try:
+            # SquashFS in dissect can take a file-like object
+            # We might need to wrap it if it has an offset
+            if self.offset != 0:
+                # Simple wrapper to handle offset if dissect doesn't
+                self.sfs = SquashFS(OffsetWrapper(self.fo, self.offset))
+            else:
+                self.sfs = SquashFS(self.fo)
+        except Exception:
+            self.close()  # release a handle we opened ourselves
+            raise
 
     @property
     def closed(self):
@@ -241,19 +249,14 @@ class SquashFSFileSystem(AbstractFileSystem):
 
     def close(self):
         """Close filesystem resources and owned archive handle."""
-        if hasattr(self, "_closed") and self._closed:
+        if self._closed:
             return
         self._closed = True
         try:
-            if hasattr(self, "sfs") and hasattr(self.sfs, "close"):
+            if self.sfs is not None and hasattr(self.sfs, "close"):
                 self.sfs.close()
         finally:
-            if (
-                hasattr(self, "_close_fo")
-                and self._close_fo
-                and hasattr(self, "fo")
-                and self.fo is not None
-            ):
+            if self._close_fo and self.fo is not None:
                 self.fo.close()
 
     def __enter__(self):
